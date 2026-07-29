@@ -1118,6 +1118,7 @@ def _export_transformers_checkpoint_streaming(
                     continue
                 seen_keys.add(full_key)
                 _stream_tensor(full_key, tensor)
+        ctx.reset_tied_caches()
 
     # Non-decoder modules with offload hooks (embed_tokens, norm, lm_head, etc.)
     for name, module in model.named_modules():
@@ -1143,6 +1144,7 @@ def _export_transformers_checkpoint_streaming(
                     continue
                 seen_keys.add(full_key)
                 _stream_tensor(full_key, tensor)
+        ctx.reset_tied_caches()
 
     # GPU-resident parameters and persistent buffers (not covered by the above loops).
     # named_buffers() includes non-persistent buffers that state_dict() excludes; filter them.
