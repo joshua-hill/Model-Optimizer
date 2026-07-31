@@ -1537,3 +1537,43 @@ def test_get_auto_quantize_config_emits_fused_expert_quantizer_names(with_persis
     assert f"{module_name}.down_proj_weight_quantizer" in quantizer_names
     assert f"{module_name}.weight_quantizer" not in quantizer_names
 
+
+def test_mla_projections_share_one_group():
+    """TRT-LLM fuses q_a_proj + kv_a_proj_with_mqa, so they must share one quant format."""
+
+    class _MLAAttention(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_a_proj = torch.nn.Linear(32, 32)
+            self.kv_a_proj_with_mqa = torch.nn.Linear(32, 32)
+            self.o_proj = torch.nn.Linear(32, 32)
+
+        def forward(self, x):
+            return self.o_proj(self.q_a_proj(x) + self.kv_a_proj_with_mqa(x))
+
+    class _MLABlock(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.self_attn = _MLAAttention()
+
+        def forward(self, x):
+            return self.self_attn(x)
+
+        def get_input(self):
+            return torch.randn(1, 4, 32)
+
+    model = _MLABlock()
+    mtq.auto_quantize(
+        model,
+        constraints={"effective_bits": 8.0},
+        quantization_formats=[mtq.INT8_DEFAULT_CFG],
+        data_loader=[model.get_input() for _ in range(2)],
+        forward_step=lambda model, batch: model(batch),
+        loss_func=lambda output, data: output.sum(),
+        num_calib_steps=2,
+        num_score_steps=2,
+        method="gradient",
+    )
+    hparam = model.self_attn.q_a_proj.get_hparam("quant_recipe")
+    assert model.self_attn.kv_a_proj_with_mqa.get_hparam("quant_recipe") == hparam
+    assert model.self_attn.o_proj.get_hparam("quant_recipe") != hparam

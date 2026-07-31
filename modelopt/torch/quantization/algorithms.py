@@ -649,6 +649,9 @@ class _AutoQuantizeBaseSearcher(BaseSearcher, ABC):
         r"^(.*?)\.(gate_proj|up_proj)$",  # gate_proj, up_proj for llama like models
         r"^(.*?)\.(\d+\.(w1|w2|w3))$",  # mixtral experts
         r"^(.*?)\.((w1_linear|w2_linear|w3_linear)\.\d+)$",  # dbrx experts
+        # MLA low-rank input projections (DeepSeek/GLM lineage): TRT-LLM fuses them into
+        # fused_qkv_a_proj_with_mqa, so the shards must share one quantization format
+        r"^(.*?)\.(q_a_proj|kv_a_proj_with_mqa)$",
         # Qwen3.5/3.6 hybrid linear_attn: vLLM fuses (in_proj_qkv, in_proj_z)
         # into ``in_proj_qkvz`` and (in_proj_a, in_proj_b) into ``in_proj_ba`` and
         # requires fused shards to share quant_algo. Two callables (not one
