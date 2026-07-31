@@ -304,6 +304,17 @@ def is_speculative(hf_config):
     )
 
 
+def is_diffusion_gemma(hf_config) -> bool:
+    """Check if the model architecture is DiffusionGemma.
+
+    Matches on both ``model_type`` and ``architectures`` and ignores underscores,
+    since the family is spelled ``diffusion_gemma`` in some places and
+    ``DiffusionGemma`` in others.
+    """
+    names = [getattr(hf_config, "model_type", None) or "", *(hf_config.architectures or [])]
+    return any("diffusiongemma" in name.lower().replace("_", "") for name in names)
+
+
 def get_tokenizer(ckpt_path, trust_remote_code=False, **kwargs) -> PreTrainedTokenizerBase:
     print(f"Initializing tokenizer from {ckpt_path}")
 
@@ -695,6 +706,18 @@ def get_model(
     # Note: Forcibly converting the model precision between bf16 and fp16 may introduce accuracy drop
     model_kwargs = config_kwargs.copy()
     model_kwargs.setdefault("dtype", "auto")
+
+    # DiffusionGemma ties weights between its encoder and decoder. device_map "auto"
+    # (balanced) can place the two sides of a tied pair on different GPUs; the tie then
+    # cannot be honored and one side is left on the meta device, so generation dies with
+    # "Tensor.item() cannot be called on meta tensors". Sequential mapping keeps tied
+    # modules together. Same class of failure as the T5 case handled below.
+    if device != "cpu" and is_diffusion_gemma(hf_config):
+        print(
+            "Detected DiffusionGemma model. Using device_map='sequential'; the balanced "
+            "'auto' mapping can split its tied encoder/decoder weights across GPUs."
+        )
+        use_seq_device_map = True
 
     if use_seq_device_map:
         device_map = "sequential"
