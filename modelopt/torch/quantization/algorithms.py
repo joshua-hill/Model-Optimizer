@@ -17,6 +17,7 @@
 
 import copy
 import fnmatch
+import functools
 import gc
 import types
 import warnings
@@ -268,6 +269,12 @@ def estimate_quant_compression(quant_cfg: QuantizeConfig) -> float:
     return estimate_quant_compression_for_quantizer(cfgs) if cfgs else 1.0
 
 
+@functools.cache
+def _no_quant_signature() -> str:
+    """Canonical signature of the no-quant recipe, used to pin it last in the format ladder."""
+    return QuantRecipe(quant_cfg=None).checkpoint_signature
+
+
 class QuantRecipe(CustomHPType):
     """A subclass of QuantizeConfig enabling auto_quantize specific configurations.
 
@@ -308,6 +315,11 @@ class QuantRecipe(CustomHPType):
         """Return the canonical identity used for ordering and checkpoint validation."""
         return getattr(self, "_config_signature", self.config.model_dump_json())
 
+    @property
+    def is_no_quant(self) -> bool:
+        """Whether this recipe leaves the module unquantized."""
+        return self.checkpoint_signature == _no_quant_signature()
+
     @staticmethod
     def get_auto_name_for_config(quant_cfg: str | dict[str, Any] | None) -> str | None:
         """Get a name for the quantization configuration."""
@@ -332,8 +344,11 @@ class QuantRecipe(CustomHPType):
         return self._str_repr
 
     def __lt__(self, other: "QuantRecipe"):
-        return (self.compression, self.checkpoint_signature) < (
+        # Pin no_quant last among equal-compression recipes: callers read ``choices[0]`` as the
+        # most aggressive candidate and the last entry as the unquantized end.
+        return (self.compression, self.is_no_quant, self.checkpoint_signature) < (
             other.compression,
+            other.is_no_quant,
             other.checkpoint_signature,
         )
 
@@ -413,8 +428,10 @@ class QuantRecipeHparam(Hparam):
         self.allow_no_quant = allow_no_quant
         self.is_fixed = fixed_recipe is not None
 
-        self.quant_modules = list(set(quant_modules or []))
-        self.score_modules = list(set(score_modules or self.quant_modules))
+        # dict.fromkeys, not set: nn.Module hashes by identity, so set order differs between
+        # ranks, and get_score picks a representative from this list to supply collective groups.
+        self.quant_modules = list(dict.fromkeys(quant_modules or []))
+        self.score_modules = list(dict.fromkeys(score_modules or self.quant_modules))
 
         fixed_quantizers = (
             {
@@ -531,7 +548,18 @@ class QuantRecipeHparam(Hparam):
             if importance is None:
                 continue
 
+            # A group scoring at a plain container has no parallel_state of its own, but its
+            # importance is still a per-rank partial sum: fall back to the group's quant modules.
             parallel_state = getattr(score_module, "parallel_state", None)
+            if parallel_state is None:
+                parallel_state = next(
+                    (
+                        state
+                        for module in self.quant_modules
+                        if (state := getattr(module, "parallel_state", None)) is not None
+                    ),
+                    None,
+                )
 
             if parallel_state is None:
                 total_score += importance.cpu().item()
@@ -632,10 +660,12 @@ class _AutoQuantizeBaseSearcher(BaseSearcher, ABC):
     # certain modules to share the same format. Sensitivity scores are computed from perturbations
     # at score modules. See AutoQuantizeGradientSearcher for detailed documentation.
 
-    candidate_stats: dict[str, dict[str, list[float]]]
+    candidate_stats: dict[str, dict[str, Any]]
     best: dict[str, Any]
     quantizer_states: dict
     method_name: str | None = None
+    # Config keys settable through ``auto_quantize(method_options=...)``.
+    method_options_keys: frozenset[str] = frozenset()
 
     quant_grouping_rules = [
         r"^(.*?)\.(q_proj|k_proj|v_proj)$",  # q_proj, k_proj, v_proj for llama like models
@@ -660,7 +690,11 @@ class _AutoQuantizeBaseSearcher(BaseSearcher, ABC):
 
     @property
     def default_search_config(self):
-        """Get the default config for the searcher."""
+        """Get the default config for the searcher.
+
+        A fresh literal, not an extension of ``BaseSearcher``'s defaults: ``score_func`` is
+        intentionally absent for every AutoQuantize method.
+        """
         return {
             "quantization_formats": ["NVFP4_DEFAULT_CFG", "FP8_DEFAULT_CFG"],
             "fixed_quantization_config": None,
@@ -708,6 +742,9 @@ class _AutoQuantizeBaseSearcher(BaseSearcher, ABC):
             "`forward_step` must be provided for `auto_quantize`."
         )
         return config
+
+    def validate_search_input(self, constraints, config) -> None:
+        """Hook for cross-field input validation before the model is converted."""
 
     def load_search_checkpoint(self) -> bool:
         return super().load_search_checkpoint(strict=False)
@@ -1056,7 +1093,7 @@ class _AutoQuantizeBaseSearcher(BaseSearcher, ABC):
             if not isinstance(hparam, QuantRecipeHparam):
                 continue
 
-            formats, scores, costs = [], [], []
+            formats, raw_scores, scores, costs = [], [], [], []
             prev_score = float("inf")
             for recipe in hparam.solver_choices:
                 formats.append(recipe)
@@ -1064,12 +1101,16 @@ class _AutoQuantizeBaseSearcher(BaseSearcher, ABC):
                 score = hparam.get_score(recipe)
                 cost = hparam.get_cost(recipe)
 
+                raw_scores.append(score)
                 score = min(score, prev_score)  # TODO: Should we get rid of this?
                 scores.append(score)
                 costs.append(cost)
                 prev_score = score
 
             self.candidate_stats[name]["formats"] = formats
+            # Unclamped values, aligned with ``formats``, for method-specific fitting and
+            # diagnostics (the reduction in get_score is a collective; run it only once).
+            self.candidate_stats[name]["raw_scores"] = raw_scores
             self.candidate_stats[name]["scores"] = scores
             self.candidate_stats[name]["costs"] = costs
             self.candidate_stats[name]["module_names"] = hparam.quant_module_names
@@ -1946,6 +1987,13 @@ class AutoQuantizeKLDivSearcher(_AutoQuantizeBaseSearcher):
 # Backward compatibility alias (defaults to gradient-based searcher)
 AutoQuantizeSearcher = AutoQuantizeGradientSearcher
 
+# Registry of auto_quantize sensitivity-scoring methods. Additional methods register
+# themselves here on import (see e.g. _auto_quantize_shapley).
+AUTO_QUANTIZE_SEARCHERS: dict[str, type[_AutoQuantizeBaseSearcher]] = {
+    AutoQuantizeGradientSearcher.method_name: AutoQuantizeGradientSearcher,
+    AutoQuantizeKLDivSearcher.method_name: AutoQuantizeKLDivSearcher,
+}
+
 
 def _as_list(value) -> list:
     if value is None:
@@ -2078,14 +2126,12 @@ def _resolve_best_recipe(search_state, constraints, verbose=False):
     max_weight_size = total_weight_size * compression
     method = search_state["method"]
 
-    if method == "gradient":
-        searcher = AutoQuantizeGradientSearcher()
-    elif method == "kl_div":
-        searcher = AutoQuantizeKLDivSearcher()
-    else:
+    if method not in AUTO_QUANTIZE_SEARCHERS:
         raise ValueError(
-            f"Unknown autoquant search method: {method!r}. Expected 'gradient' or 'kl_div'."
+            f"Unknown autoquant search method: {method!r}. "
+            f"Expected one of {sorted(AUTO_QUANTIZE_SEARCHERS)}."
         )
+    searcher = AUTO_QUANTIZE_SEARCHERS[method]()
 
     searcher.candidate_stats = candidate_stats
     searcher.cost_model = search_state.get("cost_model", COST_MODEL_WEIGHT)
@@ -2103,6 +2149,11 @@ def _resolve_best_recipe(search_state, constraints, verbose=False):
         "cost": searcher.cost,
         "active_moe_expert_ratio": searcher.active_moe_expert_ratio,
     }
+    # Method-specific state (e.g. the aumann_shapley damage model) participates in the
+    # re-solve; restore whatever the searcher declares beyond the fields set above.
+    for key in searcher.default_state_dict:
+        if key in search_state and not hasattr(searcher, key):
+            setattr(searcher, key, search_state[key])
     best_recipe_info, _ = searcher.run_search_with_stats(max_weight_size, verbose=verbose)
 
     best_recipe = {name: info["format"] for name, info in best_recipe_info.items()}
