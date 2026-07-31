@@ -492,7 +492,7 @@ def auto_quantize(
             inputs_ = {k: v for k, v in batch.items() if k != "labels"} if is_base_model else batch
             return model(**inputs_)
 
-    elif inputs["method"] == "kl_div":
+    elif inputs["method"] in ("kl_div", "aumann_shapley"):
 
         def forward_step(model, batch):
             inputs_ = {k: v for k, v in batch.items() if k != "labels"} if is_base_model else batch
@@ -504,7 +504,8 @@ def auto_quantize(
 
     else:
         raise ValueError(
-            f"Invalid auto_quantize method: {inputs['method']}. Must be 'gradient' or 'kl_div'"
+            f"Invalid auto_quantize method: {inputs['method']}. Must be 'gradient', 'kl_div', "
+            "or 'aumann_shapley'"
         )
 
     language_model, _ = mtq.auto_quantize(
@@ -1569,7 +1570,7 @@ def parse_args() -> argparse.Namespace:
         "--auto_quantize_method",
         type=str,
         default="gradient",
-        choices=["gradient", "kl_div"],
+        choices=["gradient", "kl_div", "aumann_shapley"],
         help="[Deprecated: use an AutoQuantize --recipe] Sensitivity scoring method.",
     )
     parser.add_argument(

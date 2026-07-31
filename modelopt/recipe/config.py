@@ -254,10 +254,12 @@ class AutoQuantizeConfig(ModeloptBaseConfig):
         description="Optional per-module overrides for candidate formats and BF16/no-quant "
         "selectability. Matching is performed after runtime-fusion grouping.",
     )
-    auto_quantize_method: Literal["gradient", "kl_div"] = ModeloptField(
+    auto_quantize_method: Literal["gradient", "kl_div", "aumann_shapley"] = ModeloptField(
         default="gradient",
         title="Sensitivity scoring method",
-        description="'gradient' (Taylor + Fisher, needs labels) or 'kl_div' (no labels).",
+        description="'gradient' (Taylor + Fisher, needs labels), 'kl_div' (no labels), or "
+        "'aumann_shapley' (no labels; path-integral damage attributions with a predicted-damage "
+        "quote).",
     )
     score_size: int = ModeloptField(
         default=128,
