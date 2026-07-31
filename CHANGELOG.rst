@@ -24,6 +24,7 @@ Changelog
 **Backward Breaking Changes**
 
 - Transformer Engine ``TEGroupedMLP`` (fused MoE experts) now uses **per-expert** weight quantization (one ``amax`` per expert) instead of a single shared ``amax``, so ModelOpt checkpoints containing quantized ``TEGroupedMLP`` modules saved before 0.47 are **not compatible** with 0.47. Re-run PTQ to regenerate compatible checkpoints.
+- ``mtq.auto_quantize`` now assigns the MLA low-rank input projections (``q_a_proj`` and ``kv_a_proj_with_mqa``, DeepSeek/GLM lineage) a single shared quantization format, since TensorRT-LLM fuses them into one GEMM. AutoQuantize search checkpoints for these models saved before 0.47 no longer match the current runtime grouping and are rejected on resume; re-run the search with a new ``checkpoint`` path.
 
 **Deprecations**
 
